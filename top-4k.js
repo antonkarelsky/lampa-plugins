@@ -3,11 +3,15 @@
  *
  * Ряд на главной странице: только значимые новинки, которые уже вышли в 4K.
  * Источник новинок и качества — лента релизов Lampa (CUB, поле release_quality).
- * Значимость определяется по данным TMDB:
- *   - фильмы студии A24 — всегда;
- *   - популярные: много оценок или высокая популярность;
- *   - резонансные: высокий рейтинг при заметном числе оценок.
- * Результат кэшируется на 6 часов, чтобы не нагружать главную.
+ * Значимость — по данным TMDB:
+ *   - фильмы и сериалы A24 — всегда;
+ *   - блокбастеры: очень много оценок или очень высокая популярность;
+ *   - резонансные: высокий рейтинг при большом числе оценок.
+ * Фильтры (в «Моих плагинах»):
+ *   - период по дате премьеры: 3 или 6 месяцев;
+ *   - сортировка: по дате выхода или по популярности;
+ *   - скрывать ужасы (кроме списка исключений).
+ * Результат кэшируется на 6 часов.
  */
 (function () {
     'use strict';
@@ -17,22 +21,63 @@
 
     var ROW_NAME = 'anton_top_4k';
     var ROW_TITLE = 'Главное в 4K';
-    var CACHE_KEY = 'anton_top4k_cache';
+    var CACHE_KEY = 'anton_top4k_cache_v2';
     var CACHE_HOURS = 6;
-    var PAGES = 4;            // страниц ленты релизов (≈20 фильмов на страницу)
+    var PAGES = 6;            // страниц ленты релизов (≈20 на страницу)
     var MAX_ITEMS = 20;
 
     var A24_COMPANY = 41077;  // A24 в TMDB
+    var HORROR_GENRE = 27;
+
+    // Ужасы, которые показываем несмотря на фильтр (оригинальное название, без учёта регистра)
+    var HORROR_ALLOW = ['backrooms'];
 
     // Пороги значимости
-    var MIN_VOTES_POPULAR = 500;     // много оценок
-    var MIN_POPULARITY = 80;         // высокая популярность TMDB
-    var MIN_VOTES_ACCLAIMED = 150;   // для «резонансных»
-    var MIN_RATING_ACCLAIMED = 7.3;
+    var MIN_VOTES_BLOCKBUSTER = 1000;
+    var MIN_POPULARITY = 150;
+    var MIN_VOTES_ACCLAIMED = 300;
+    var MIN_RATING_ACCLAIMED = 7.5;
+
+    // Настройки
+    var S_PERIOD = 'anton_top4k_period';   // '90' | '180'
+    var S_SORT = 'anton_top4k_sort';       // 'date' | 'popular'
+    var S_NOHORROR = 'anton_top4k_nohorror';
+
+    function setting(name, def) {
+        var v = Lampa.Storage.get(name, '');
+        return v === '' ? def : v;
+    }
+
+    function periodDays() { return parseInt(setting(S_PERIOD, '90')) || 90; }
+    function sortMode() { return setting(S_SORT, 'date'); }
+    function hideHorror() {
+        var v = setting(S_NOHORROR, true);
+        return v === true || v === 'true';
+    }
+
+    function releaseTime(card) {
+        var d = card.release_date || card.first_air_date || '';
+        var t = Date.parse(d);
+        return isNaN(t) ? 0 : t;
+    }
 
     function is4k(card) {
         var q = (card.release_quality || card.quality || '') + '';
         return /4k|2160|uhd/i.test(q);
+    }
+
+    function inPeriod(card) {
+        var t = releaseTime(card);
+        if (!t) return false;
+        return Date.now() - t <= periodDays() * 24 * 3600 * 1000;
+    }
+
+    function isHorrorBlocked(card) {
+        if (!hideHorror()) return false;
+        var genres = card.genre_ids || (card.genres || []).map(function (g) { return g.id; });
+        if (genres.indexOf(HORROR_GENRE) === -1) return false;
+        var title = ((card.original_title || card.original_name || '') + ' ' + (card.title || card.name || '')).toLowerCase();
+        return !HORROR_ALLOW.some(function (w) { return title.indexOf(w) >= 0; });
     }
 
     function isSignificant(card, a24) {
@@ -40,19 +85,19 @@
         var votes = card.vote_count || 0;
         var rating = card.vote_average || 0;
         var pop = card.popularity || 0;
-        if (votes >= MIN_VOTES_POPULAR) return true;
+        if (votes >= MIN_VOTES_BLOCKBUSTER) return true;
         if (pop >= MIN_POPULARITY) return true;
         if (votes >= MIN_VOTES_ACCLAIMED && rating >= MIN_RATING_ACCLAIMED) return true;
         return false;
     }
 
-    function score(card, a24) {
-        return (card.popularity || 0) + (a24[card.id] ? 50 : 0) + (card.vote_average || 0) * 3;
+    function cacheKey() {
+        return CACHE_KEY + '_' + periodDays() + '_' + sortMode() + '_' + (hideHorror() ? 1 : 0);
     }
 
     function readCache() {
         try {
-            var c = Lampa.Storage.get(CACHE_KEY, '{}');
+            var c = Lampa.Storage.get(cacheKey(), '{}');
             if (typeof c === 'string') c = JSON.parse(c);
             if (c && c.time && Date.now() - c.time < CACHE_HOURS * 3600 * 1000 && c.results) return c.results;
         } catch (e) {}
@@ -60,10 +105,9 @@
     }
 
     function writeCache(results) {
-        try { Lampa.Storage.set(CACHE_KEY, { time: Date.now(), results: results }); } catch (e) {}
+        try { Lampa.Storage.set(cacheKey(), { time: Date.now(), results: results }); } catch (e) {}
     }
 
-    // A24: последние фильмы и сериалы студии (id в TMDB)
     function loadA24(done) {
         var a24 = {};
         var pending = 2;
@@ -84,7 +128,6 @@
         });
     }
 
-    // Лента релизов Lampa: несколько страниц
     function loadReleases(done) {
         var all = [];
         var pending = PAGES;
@@ -115,24 +158,30 @@
                     seen[c.id] = true;
                     return true;
                 });
-                var uhd = unique.filter(is4k);
-                var results = uhd.filter(function (c) { return isSignificant(c, a24); });
 
-                var qualities = {};
-                unique.forEach(function (c) {
-                    var q = (c.release_quality || c.quality || '—') + '';
-                    qualities[q] = (qualities[q] || 0) + 1;
-                });
+                var uhd = unique.filter(is4k);
+                var recent = uhd.filter(inPeriod);
+                var noHorror = recent.filter(function (c) { return !isHorrorBlocked(c); });
+                var results = noHorror.filter(function (c) { return isSignificant(c, a24); });
+
+                if (sortMode() === 'popular') {
+                    results.sort(function (a, b) {
+                        return ((b.popularity || 0) + (a24[b.id] ? 50 : 0)) - ((a.popularity || 0) + (a24[a.id] ? 50 : 0));
+                    });
+                } else {
+                    results.sort(function (a, b) { return releaseTime(b) - releaseTime(a); });
+                }
+
+                results = results.slice(0, MAX_ITEMS);
+
                 lastStats = {
                     releases: unique.length,
                     uhd: uhd.length,
+                    recent: recent.length,
+                    noHorror: noHorror.length,
                     significant: results.length,
-                    a24: Object.keys(a24).length,
-                    qualities: qualities
+                    titles: results.slice(0, 8).map(function (c) { return c.title || c.name; })
                 };
-
-                results.sort(function (a, b) { return score(b, a24) - score(a, a24); });
-                results = results.slice(0, MAX_ITEMS);
 
                 if (results.length) writeCache(results);
                 done(results);
@@ -144,6 +193,18 @@
         return !!(Lampa.ContentRows && Lampa.Api && typeof Lampa.Api.relise === 'function');
     }
 
+    function clearCache() {
+        try {
+            ['90', '180'].forEach(function (p) {
+                ['date', 'popular'].forEach(function (s) {
+                    [0, 1].forEach(function (h) {
+                        Lampa.Storage.set(CACHE_KEY + '_' + p + '_' + s + '_' + h, {});
+                    });
+                });
+            });
+        } catch (e) {}
+    }
+
     function diagnose() {
         if (!supported()) {
             return Lampa.Noty.show('Главное в 4K: эта версия Lampa не поддерживает ряды на главной');
@@ -151,29 +212,62 @@
         Lampa.Noty.show('Главное в 4K: собираю список…');
         build(function (results) {
             var st = lastStats || {};
-            var q = Object.keys(st.qualities || {}).slice(0, 6).map(function (k) {
-                return k + ': ' + st.qualities[k];
-            }).join(', ');
-            Lampa.Noty.show('Релизов: ' + (st.releases || 0) + ', в 4K: ' + (st.uhd || 0) +
-                ', значимых: ' + results.length + '. A24: ' + (st.a24 || 0) +
-                (q ? '. Качество: ' + q : ''));
+            Lampa.Noty.show('Релизов: ' + (st.releases || 0) +
+                ', в 4K: ' + (st.uhd || 0) +
+                ', за период: ' + (st.recent || 0) +
+                ', без ужасов: ' + (st.noHorror || 0) +
+                ', в ряду: ' + results.length +
+                (st.titles && st.titles.length ? '. ' + st.titles.join(', ') : ''));
         }, true);
     }
 
+    function addSettings() {
+        if (!Lampa.SettingsApi) return;
+        try {
+            Lampa.SettingsApi.addParam({
+                component: 'anton_plugins',
+                param: { name: S_PERIOD, type: 'select', values: { '90': '3 месяца', '180': '6 месяцев' }, 'default': '90' },
+                field: { name: 'Главное в 4K: период', description: 'По дате премьеры' },
+                onChange: clearCache
+            });
+            Lampa.SettingsApi.addParam({
+                component: 'anton_plugins',
+                param: { name: S_SORT, type: 'select', values: { 'date': 'Сначала новые', 'popular': 'Сначала популярные' }, 'default': 'date' },
+                field: { name: 'Главное в 4K: сортировка' },
+                onChange: clearCache
+            });
+            Lampa.SettingsApi.addParam({
+                component: 'anton_plugins',
+                param: { name: S_NOHORROR, type: 'trigger', 'default': true },
+                field: { name: 'Главное в 4K: скрывать ужасы', description: 'Кроме исключений (Backrooms)' },
+                onChange: clearCache
+            });
+            Lampa.SettingsApi.addParam({
+                component: 'anton_plugins',
+                param: { name: 'anton_top4k_diag', type: 'button' },
+                field: {
+                    name: 'Главное в 4K: обновить и показать статистику',
+                    description: 'Сбрасывает кэш и показывает, что попало в ряд'
+                },
+                onChange: diagnose
+            });
+        } catch (e) {}
+    }
+
+    // Плагин загружается после того, как главная уже построена — перестраиваем её один раз
+    function refreshMainIfOpen() {
+        try {
+            var active = Lampa.Activity.active();
+            if (active && active.component === 'main') {
+                var params = Object.assign({}, active);
+                delete params.activity;
+                Lampa.Activity.replace(params);
+            }
+        } catch (e) {}
+    }
+
     function init() {
-        if (Lampa.SettingsApi) {
-            try {
-                Lampa.SettingsApi.addParam({
-                    component: 'anton_plugins',
-                    param: { name: 'anton_top4k_diag', type: 'button' },
-                    field: {
-                        name: 'Главное в 4K: обновить и показать статистику',
-                        description: 'Сбрасывает кэш и показывает, сколько релизов найдено'
-                    },
-                    onChange: diagnose
-                });
-            } catch (e) {}
-        }
+        addSettings();
 
         if (!supported()) {
             console.log('Главное в 4K: эта версия Lampa не поддерживает ряды на главной');
@@ -201,6 +295,8 @@
                 };
             }
         });
+
+        refreshMainIfOpen();
     }
 
     if (window.appready) init();
