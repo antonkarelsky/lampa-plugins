@@ -1,7 +1,9 @@
 /*
  * Проверка скорости раздачи — плагин для Lampa
  *
- * В списке торрентов: долгое нажатие ОК на раздаче → «Проверить скорость раздачи».
+ * При выборе раздачи (ОК) сначала открывается окно проверки скорости.
+ * Кнопка «Смотреть» доступна сразу — ждать конца замера не обязательно.
+ * Режим отключается в «Моих плагинах». Также работает через долгое нажатие (мышью).
  * Плагин добавляет раздачу в TorrServer, ~25 секунд замеряет скорость загрузки
  * и сравнивает её с битрейтом видео:
  *   🟢 скорость ≥ 1,3 × битрейт — пойдёт ровно
@@ -78,7 +80,7 @@
         }, null);
     }
 
-    function check(element, item, movie, prevController) {
+    function check(element, movie, prevController, onWatch) {
         var link = element.MagnetUri || element.Link;
         if (!serverUrl()) return Lampa.Noty.show('Адрес TorrServer не задан в настройках Lampa');
         if (!link) return Lampa.Noty.show('У этой раздачи нет ссылки для проверки');
@@ -126,7 +128,7 @@
 
         function watch() {
             closeModal();
-            setTimeout(function () { item.trigger('hover:enter'); }, 100);
+            setTimeout(onWatch, 100);
         }
 
         Lampa.Modal.open({
@@ -281,7 +283,51 @@
         }
     }
 
+    var SETTING = 'anton_speed_before_play';
+    var bypass = false;
+
+    function beforePlayEnabled() {
+        var v = Lampa.Storage.get(SETTING, '');
+        return v === '' ? true : (v === true || v === 'true');
+    }
+
     function init() {
+        // Переключатель в «Моих плагинах»
+        if (Lampa.SettingsApi) {
+            try {
+                Lampa.SettingsApi.addParam({
+                    component: 'anton_plugins',
+                    param: { name: SETTING, type: 'trigger', 'default': true },
+                    field: {
+                        name: 'Проверять скорость при выборе раздачи',
+                        description: 'Проверка скорости раздачи: окно замера перед запуском'
+                    }
+                });
+            } catch (e) {}
+        }
+
+        // Перехватываем запуск торрента: сначала окно проверки, потом просмотр
+        if (Lampa.Torrent && typeof Lampa.Torrent.start === 'function') {
+            var originalStart = Lampa.Torrent.start;
+
+            Lampa.Torrent.start = function (element, movie) {
+                var self = this;
+                var args = arguments;
+
+                if (bypass || !beforePlayEnabled() || !(element && (element.MagnetUri || element.Link))) {
+                    return originalStart.apply(self, args);
+                }
+
+                var prev = Lampa.Controller.enabled().name;
+
+                check(element, movie, prev, function () {
+                    bypass = true;
+                    try { originalStart.apply(self, args); } finally { bypass = false; }
+                });
+            };
+        }
+
+        // Долгое нажатие (работает мышью / на некоторых пультах)
         Lampa.Listener.follow('torrent', function (e) {
             if (e.type !== 'onlong' || !e.menu) return;
 
@@ -295,7 +341,12 @@
                 title: 'Проверить скорость раздачи',
                 subtitle: 'Замер ~25 секунд и сравнение с битрейтом',
                 onSelect: function () {
-                    setTimeout(function () { check(element, item, movie, prevController); }, 50);
+                    setTimeout(function () {
+                        check(element, movie, prevController, function () {
+                            bypass = true;
+                            try { item.trigger('hover:enter'); } finally { bypass = false; }
+                        });
+                    }, 50);
                 }
             });
         });
