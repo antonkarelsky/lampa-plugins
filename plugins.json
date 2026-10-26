@@ -5,5 +5,12 @@
         "name": "Сторож TorrServer",
         "description": "Предупреждает, если TorrServer не отвечает",
         "default": true
+    },
+    {
+        "id": "torrent_speed_check",
+        "file": "torrent-speed-check.js",
+        "name": "Проверка скорости раздачи",
+        "description": "Долгое нажатие ОК на раздаче → замер скорости и сравнение с битрейтом",
+        "default": false
     }
 ]
