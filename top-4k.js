@@ -21,7 +21,7 @@
 
     var ROW_NAME = 'anton_top_4k';
     var ROW_TITLE = 'Главное в 4K';
-    var CACHE_KEY = 'anton_top4k_cache_v3';
+    var CACHE_KEY = 'anton_top4k_cache_v4';
     var CACHE_HOURS = 6;
     var PAGES = 12;           // страниц ленты релизов (≈20 на страницу, ≈ последний квартал цифровых релизов)
     var MAX_ITEMS = 20;
@@ -31,6 +31,17 @@
 
     // Ужасы, которые показываем несмотря на фильтр (оригинальное название, без учёта регистра)
     var HORROR_ALLOW = ['backrooms'];
+
+    // Скрытые вручную (русское или оригинальное название, точное совпадение без учёта регистра)
+    var HIDDEN_TITLES = ['мятеж', 'хитрый койот', 'мститель', 'убежище', 'гренландия 2', 'живая ярость'];
+
+    // Минимальный рейтинг TMDB для всего, кроме A24
+    var MIN_RATING_ANY = 7.0;
+
+    // Свежие кинотеатральные фильмы, которых ещё нет в ленте релизов:
+    // берём из TMDB (сейчас в кино, тренды недели) и проверяем 4K-раздачи через парсер
+    var EXTRA_SOURCES = ['movie/now_playing', 'trending/movie/week', 'movie/popular'];
+    var MIN_4K_SEEDS = 5;
 
     // Пороги значимости
     var MIN_VOTES_BLOCKBUSTER = 1000;
@@ -80,8 +91,16 @@
         return !HORROR_ALLOW.some(function (w) { return title.indexOf(w) >= 0; });
     }
 
+    function norm(t) { return ((t || '') + '').toLowerCase().replace(/ё/g, 'е').trim(); }
+
+    function isHidden(card) {
+        var names = [card.title, card.name, card.original_title, card.original_name].map(norm);
+        return HIDDEN_TITLES.some(function (h) { return names.indexOf(norm(h)) >= 0; });
+    }
+
     function isSignificant(card, a24) {
         if (a24[card.id]) return true;
+        if ((card.vote_average || 0) < MIN_RATING_ANY) return false;
         var votes = card.vote_count || 0;
         var rating = card.vote_average || 0;
         var pop = card.popularity || 0;
@@ -147,6 +166,84 @@
         })(p);
     }
 
+    function jackettBase() {
+        var url = (Lampa.Storage.field('jackett_url') || '') + '';
+        url = url.replace('jacred.xyz', 'jac.red').trim().replace(/\/+$/, '');
+        if (!url) return '';
+        if (!/^https?:\/\//i.test(url)) url = 'https://' + url;
+        return url;
+    }
+
+    // Есть ли 4K-раздача с живыми сидами
+    function has4kTorrent(card, done) {
+        var base = jackettBase();
+        if (!base) return done(false);
+
+        var year = ((card.release_date || '0000') + '').slice(0, 4);
+        var u = base + '/api/v2.0/indexers/all/results?apikey=' + encodeURIComponent(Lampa.Storage.field('jackett_key') || '') +
+            '&Query=' + encodeURIComponent(card.title || card.original_title || '') +
+            '&title=' + encodeURIComponent(card.title || '') +
+            '&title_original=' + encodeURIComponent(card.original_title || '') +
+            '&year=' + year + '&is_serial=1&Category[]=2000';
+
+        var xhr = new XMLHttpRequest();
+        xhr.open('GET', u, true);
+        xhr.timeout = 15000;
+        xhr.onload = function () {
+            var found = false;
+            try {
+                var json = JSON.parse(xhr.responseText);
+                found = (json.Results || []).some(function (r) {
+                    return /2160p|\b4k\b|uhd/i.test(r.Title || '') && (r.Seeders || 0) >= MIN_4K_SEEDS;
+                });
+            } catch (e) {}
+            done(found);
+        };
+        xhr.onerror = xhr.ontimeout = function () { done(false); };
+        xhr.send();
+    }
+
+    function loadExtra(a24, known, done) {
+        var net = new Lampa.Reguest();
+        var cards = [];
+        var pending = EXTRA_SOURCES.length;
+
+        function checkAll() {
+            var seen = {};
+            var candidates = cards.filter(function (c) {
+                if (!c || !c.id || seen[c.id] || known[c.id]) return false;
+                seen[c.id] = true;
+                return inPeriod(c) && !isHidden(c) && !isHorrorBlocked(c) && isSignificant(c, a24);
+            });
+
+            var left = candidates.length;
+            var confirmed = [];
+            if (!left) return done(confirmed);
+
+            candidates.forEach(function (c) {
+                has4kTorrent(c, function (ok) {
+                    if (ok) {
+                        c.source = 'tmdb';
+                        c.release_quality = '4K';
+                        c._anton_order = 0; // свежие кинорелизы — в начало ряда
+                        confirmed.push(c);
+                    }
+                    if (--left === 0) done(confirmed);
+                });
+            });
+        }
+
+        EXTRA_SOURCES.forEach(function (path) {
+            var url = Lampa.TMDB.api(path + '?api_key=' + Lampa.TMDB.key() + '&language=ru');
+            net.silent(url, function (json) {
+                (json && json.results || []).forEach(function (c) { cards.push(c); });
+                if (--pending === 0) checkAll();
+            }, function () {
+                if (--pending === 0) checkAll();
+            });
+        });
+    }
+
     var lastStats = null;
 
     function build(done, force) {
@@ -164,35 +261,45 @@
 
                 var uhd = unique.filter(is4k);
                 var recent = uhd.filter(inPeriod);
-                var noHorror = recent.filter(function (c) { return !isHorrorBlocked(c); });
-                var results = noHorror.filter(function (c) { return isSignificant(c, a24); });
+                var noHorror = recent.filter(function (c) { return !isHorrorBlocked(c) && !isHidden(c); });
+                var feedResults = noHorror.filter(function (c) { return isSignificant(c, a24); });
 
-                if (sortMode() === 'popular') {
-                    results.sort(function (a, b) {
-                        return ((b.popularity || 0) + (a24[b.id] ? 50 : 0)) - ((a.popularity || 0) + (a24[a.id] ? 50 : 0));
-                    });
-                } else if (sortMode() === 'date') {
-                    results.sort(function (a, b) { return releaseTime(b) - releaseTime(a); });
-                } else {
-                    // порядок ленты релизов = свежесть выхода в цифре
-                    results.sort(function (a, b) { return (a._anton_order || 0) - (b._anton_order || 0); });
-                }
+                var known = {};
+                feedResults.forEach(function (c) { known[c.id] = true; });
 
-                results = results.slice(0, MAX_ITEMS);
-
-                lastStats = {
-                    releases: unique.length,
-                    uhd: uhd.length,
-                    recent: recent.length,
-                    noHorror: noHorror.length,
-                    significant: results.length,
-                    titles: results.slice(0, 8).map(function (c) { return c.title || c.name; })
-                };
-
-                if (results.length) writeCache(results);
-                done(results);
+                loadExtra(a24, known, function (extra) {
+                    finishBuild(feedResults.concat(extra), unique, uhd, recent, noHorror, extra, a24, done);
+                });
             });
         });
+    }
+
+    function finishBuild(results, unique, uhd, recent, noHorror, extra, a24, done) {
+        if (sortMode() === 'popular') {
+            results.sort(function (a, b) {
+                return ((b.popularity || 0) + (a24[b.id] ? 50 : 0)) - ((a.popularity || 0) + (a24[a.id] ? 50 : 0));
+            });
+        } else if (sortMode() === 'date') {
+            results.sort(function (a, b) { return releaseTime(b) - releaseTime(a); });
+        } else {
+            // порядок ленты релизов = свежесть выхода в цифре; кинорелизы из TMDB — в начале
+            results.sort(function (a, b) { return (a._anton_order || 0) - (b._anton_order || 0); });
+        }
+
+        results = results.slice(0, MAX_ITEMS);
+
+        lastStats = {
+            releases: unique.length,
+            uhd: uhd.length,
+            recent: recent.length,
+            noHorror: noHorror.length,
+            extra: extra.length,
+            significant: results.length,
+            titles: results.slice(0, 8).map(function (c) { return c.title || c.name; })
+        };
+
+        if (results.length) writeCache(results);
+        done(results);
     }
 
     function supported() {
@@ -221,7 +328,8 @@
             Lampa.Noty.show('Релизов: ' + (st.releases || 0) +
                 ', в 4K: ' + (st.uhd || 0) +
                 ', премьера в пределах: ' + (st.recent || 0) +
-                ', без ужасов: ' + (st.noHorror || 0) +
+                ', без ужасов и скрытых: ' + (st.noHorror || 0) +
+                ', из кинопроката: ' + (st.extra || 0) +
                 ', в ряду: ' + results.length +
                 (st.titles && st.titles.length ? '. ' + st.titles.join(', ') : ''));
         }, true);
