@@ -101,30 +101,81 @@
         }
     }
 
-    function build(done) {
-        var cached = readCache();
+    var lastStats = null;
+
+    function build(done, force) {
+        var cached = force ? null : readCache();
         if (cached) return done(cached);
 
         loadA24(function (a24) {
             loadReleases(function (cards) {
                 var seen = {};
-                var results = cards.filter(function (c) {
+                var unique = cards.filter(function (c) {
                     if (!c || !c.id || seen[c.id]) return false;
                     seen[c.id] = true;
-                    return is4k(c) && isSignificant(c, a24);
+                    return true;
                 });
+                var uhd = unique.filter(is4k);
+                var results = uhd.filter(function (c) { return isSignificant(c, a24); });
+
+                var qualities = {};
+                unique.forEach(function (c) {
+                    var q = (c.release_quality || c.quality || '—') + '';
+                    qualities[q] = (qualities[q] || 0) + 1;
+                });
+                lastStats = {
+                    releases: unique.length,
+                    uhd: uhd.length,
+                    significant: results.length,
+                    a24: Object.keys(a24).length,
+                    qualities: qualities
+                };
 
                 results.sort(function (a, b) { return score(b, a24) - score(a, a24); });
                 results = results.slice(0, MAX_ITEMS);
 
-                writeCache(results);
+                if (results.length) writeCache(results);
                 done(results);
             });
         });
     }
 
+    function supported() {
+        return !!(Lampa.ContentRows && Lampa.Api && typeof Lampa.Api.relise === 'function');
+    }
+
+    function diagnose() {
+        if (!supported()) {
+            return Lampa.Noty.show('Главное в 4K: эта версия Lampa не поддерживает ряды на главной');
+        }
+        Lampa.Noty.show('Главное в 4K: собираю список…');
+        build(function (results) {
+            var st = lastStats || {};
+            var q = Object.keys(st.qualities || {}).slice(0, 6).map(function (k) {
+                return k + ': ' + st.qualities[k];
+            }).join(', ');
+            Lampa.Noty.show('Релизов: ' + (st.releases || 0) + ', в 4K: ' + (st.uhd || 0) +
+                ', значимых: ' + results.length + '. A24: ' + (st.a24 || 0) +
+                (q ? '. Качество: ' + q : ''));
+        }, true);
+    }
+
     function init() {
-        if (!Lampa.ContentRows || !Lampa.Api || typeof Lampa.Api.relise !== 'function') {
+        if (Lampa.SettingsApi) {
+            try {
+                Lampa.SettingsApi.addParam({
+                    component: 'anton_plugins',
+                    param: { name: 'anton_top4k_diag', type: 'button' },
+                    field: {
+                        name: 'Главное в 4K: обновить и показать статистику',
+                        description: 'Сбрасывает кэш и показывает, сколько релизов найдено'
+                    },
+                    onChange: diagnose
+                });
+            } catch (e) {}
+        }
+
+        if (!supported()) {
             console.log('Главное в 4K: эта версия Lampa не поддерживает ряды на главной');
             return;
         }
