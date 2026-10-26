@@ -8,8 +8,8 @@
  *   - блокбастеры: очень много оценок или очень высокая популярность;
  *   - резонансные: высокий рейтинг при большом числе оценок.
  * Фильтры (в «Моих плагинах»):
- *   - период по дате премьеры: 3 или 6 месяцев;
- *   - сортировка: по дате выхода или по популярности;
+ *   - лента релизов за ~последний квартал; премьера не старше 1–3 лет;
+ *   - сортировка: по свежести выхода в 4K, по дате премьеры или по популярности;
  *   - скрывать ужасы (кроме списка исключений).
  * Результат кэшируется на 6 часов.
  */
@@ -21,9 +21,9 @@
 
     var ROW_NAME = 'anton_top_4k';
     var ROW_TITLE = 'Главное в 4K';
-    var CACHE_KEY = 'anton_top4k_cache_v2';
+    var CACHE_KEY = 'anton_top4k_cache_v3';
     var CACHE_HOURS = 6;
-    var PAGES = 6;            // страниц ленты релизов (≈20 на страницу)
+    var PAGES = 12;           // страниц ленты релизов (≈20 на страницу, ≈ последний квартал цифровых релизов)
     var MAX_ITEMS = 20;
 
     var A24_COMPANY = 41077;  // A24 в TMDB
@@ -39,8 +39,8 @@
     var MIN_RATING_ACCLAIMED = 7.5;
 
     // Настройки
-    var S_PERIOD = 'anton_top4k_period';   // '90' | '180'
-    var S_SORT = 'anton_top4k_sort';       // 'date' | 'popular'
+    var S_PERIOD = 'anton_top4k_period2';  // '365' | '730' | '1095' — давность премьеры
+    var S_SORT = 'anton_top4k_sort2';      // 'release' | 'date' | 'popular'
     var S_NOHORROR = 'anton_top4k_nohorror';
 
     function setting(name, def) {
@@ -48,8 +48,8 @@
         return v === '' ? def : v;
     }
 
-    function periodDays() { return parseInt(setting(S_PERIOD, '90')) || 90; }
-    function sortMode() { return setting(S_SORT, 'date'); }
+    function periodDays() { return parseInt(setting(S_PERIOD, '730')) || 730; }
+    function sortMode() { return setting(S_SORT, 'release'); }
     function hideHorror() {
         var v = setting(S_NOHORROR, true);
         return v === true || v === 'true';
@@ -134,14 +134,17 @@
 
         function finish() { if (--pending === 0) done(all); }
 
-        for (var page = 1; page <= PAGES; page++) {
+        for (var p = 1; p <= PAGES; p++) (function (page) {
             try {
                 Lampa.Api.relise({ page: page }, function (data) {
-                    (data && data.results || []).forEach(function (c) { all.push(c); });
+                    (data && data.results || []).forEach(function (c, i) {
+                        c._anton_order = page * 1000 + i;
+                        all.push(c);
+                    });
                     finish();
                 }, finish);
             } catch (e) { finish(); }
-        }
+        })(p);
     }
 
     var lastStats = null;
@@ -168,8 +171,11 @@
                     results.sort(function (a, b) {
                         return ((b.popularity || 0) + (a24[b.id] ? 50 : 0)) - ((a.popularity || 0) + (a24[a.id] ? 50 : 0));
                     });
-                } else {
+                } else if (sortMode() === 'date') {
                     results.sort(function (a, b) { return releaseTime(b) - releaseTime(a); });
+                } else {
+                    // порядок ленты релизов = свежесть выхода в цифре
+                    results.sort(function (a, b) { return (a._anton_order || 0) - (b._anton_order || 0); });
                 }
 
                 results = results.slice(0, MAX_ITEMS);
@@ -195,8 +201,8 @@
 
     function clearCache() {
         try {
-            ['90', '180'].forEach(function (p) {
-                ['date', 'popular'].forEach(function (s) {
+            ['365', '730', '1095'].forEach(function (p) {
+                ['release', 'date', 'popular'].forEach(function (s) {
                     [0, 1].forEach(function (h) {
                         Lampa.Storage.set(CACHE_KEY + '_' + p + '_' + s + '_' + h, {});
                     });
@@ -214,7 +220,7 @@
             var st = lastStats || {};
             Lampa.Noty.show('Релизов: ' + (st.releases || 0) +
                 ', в 4K: ' + (st.uhd || 0) +
-                ', за период: ' + (st.recent || 0) +
+                ', премьера в пределах: ' + (st.recent || 0) +
                 ', без ужасов: ' + (st.noHorror || 0) +
                 ', в ряду: ' + results.length +
                 (st.titles && st.titles.length ? '. ' + st.titles.join(', ') : ''));
@@ -226,13 +232,13 @@
         try {
             Lampa.SettingsApi.addParam({
                 component: 'anton_plugins',
-                param: { name: S_PERIOD, type: 'select', values: { '90': '3 месяца', '180': '6 месяцев' }, 'default': '90' },
-                field: { name: 'Главное в 4K: период', description: 'По дате премьеры' },
+                param: { name: S_PERIOD, type: 'select', values: { '365': '1 год', '730': '2 года', '1095': '3 года' }, 'default': '730' },
+                field: { name: 'Главное в 4K: премьера не старше', description: 'Отсекает старые фильмы, переизданные в 4K' },
                 onChange: clearCache
             });
             Lampa.SettingsApi.addParam({
                 component: 'anton_plugins',
-                param: { name: S_SORT, type: 'select', values: { 'date': 'Сначала новые', 'popular': 'Сначала популярные' }, 'default': 'date' },
+                param: { name: S_SORT, type: 'select', values: { 'release': 'Недавно вышли в 4K', 'date': 'По дате премьеры', 'popular': 'Сначала популярные' }, 'default': 'release' },
                 field: { name: 'Главное в 4K: сортировка' },
                 onChange: clearCache
             });
