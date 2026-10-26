@@ -26,13 +26,13 @@
 
     var ROW_NAME = 'anton_top_4k';
     var ROW_TITLE = 'Главное в 4K';
-    var CACHE_PREFIX = 'anton_top4k_cache_v5';
+    var CACHE_PREFIX = 'anton_top4k_cache_v6';
     var CACHE_HOURS = 6;
     var MAX_ITEMS = 30;
 
     var FEED_PAGES = 6;          // страниц ленты релизов Lampa
     var DISCOVER_MOVIE_PAGES = 4; // страниц «популярные фильмы за период» (по 20)
-    var DISCOVER_TV_PAGES = 2;    // страниц «популярные сериалы за период»
+    var DISCOVER_TV_PAGES = 3;    // страниц «сериалы, у которых выходили серии за период»
     var EXTRA_LISTS = ['movie/now_playing', 'trending/movie/week', 'movie/popular', 'trending/tv/week'];
 
     var A24_COMPANY = 41077;
@@ -42,12 +42,18 @@
     var HORROR_ALLOW = ['backrooms'];
 
     // Скрытые вручную (точное совпадение русского или оригинального названия)
-    var HIDDEN_TITLES = ['мятеж', 'хитрый койот', 'мститель', 'убежище', 'гренландия 2', 'живая ярость'];
+    var HIDDEN_TITLES = ['мятеж', 'хитрый койот', 'мститель', 'убежище', 'гренландия 2', 'живая ярость',
+        'матчбокс', 'практическая магия 2', 'опасный дуэт', 'ограбить лондон'];
 
-    // Значимость
+    // Значимость (кроме A24):
+    //   широко известные — рейтинг от 7.0 и много оценок;
+    //   резонансные — рейтинг от 7.8 при заметном числе оценок.
     var MIN_RATING = 7.0;
-    var MIN_VOTES = 300;
-    var MIN_POPULARITY = 60;
+    var MIN_VOTES_MOVIE = 800;
+    var MIN_VOTES_TV = 300;
+    var ACCLAIMED_RATING = 7.8;
+    var ACCLAIMED_VOTES_MOVIE = 300;
+    var ACCLAIMED_VOTES_TV = 120;
 
     // Проверка 4K через парсер
     var MIN_4K_SEEDS = 5;
@@ -75,7 +81,7 @@
     function key(card) { return (isTv(card) ? 'tv' : 'movie') + card.id; }
 
     function releaseTime(card) {
-        var t = Date.parse(card.release_date || card.first_air_date || '');
+        var t = Date.parse(card._anton_last_air || card.release_date || card.first_air_date || '');
         return isNaN(t) ? 0 : t;
     }
 
@@ -88,6 +94,7 @@
     function ymd(d) { return d.toISOString().slice(0, 10); }
 
     function inPeriod(card) {
+        if (card._anton_recent_episodes) return true; // сериал с новыми сериями за период
         var t = releaseTime(card);
         return t && t >= periodStart().getTime() && t <= Date.now();
     }
@@ -109,8 +116,12 @@
 
     function isSignificant(card, a24) {
         if (a24[key(card)]) return true;
-        if ((card.vote_average || 0) < MIN_RATING) return false;
-        return (card.vote_count || 0) >= MIN_VOTES || (card.popularity || 0) >= MIN_POPULARITY;
+        var tv = isTv(card);
+        var votes = card.vote_count || 0;
+        var rating = card.vote_average || 0;
+        if (rating >= MIN_RATING && votes >= (tv ? MIN_VOTES_TV : MIN_VOTES_MOVIE)) return true;
+        if (rating >= ACCLAIMED_RATING && votes >= (tv ? ACCLAIMED_VOTES_TV : ACCLAIMED_VOTES_MOVIE)) return true;
+        return false;
     }
 
     function feed4k(card) {
@@ -190,10 +201,14 @@
             });
         })(p);
 
+        // Сериалы, у которых выходили серии за период (включая новые сезоны старых сериалов)
         for (var t = 1; t <= DISCOVER_TV_PAGES; t++) (function (page) {
             tasks.push(function (cb) {
                 tmdbList('discover/tv?sort_by=popularity.desc&vote_count.gte=100' +
-                    '&first_air_date.gte=' + from + '&first_air_date.lte=' + to + '&page=' + page, cb);
+                    '&air_date.gte=' + from + '&air_date.lte=' + to + '&page=' + page, function (list) {
+                    list.forEach(function (c) { c._anton_recent_episodes = true; });
+                    cb(list);
+                });
             });
         })(t);
 
@@ -316,7 +331,10 @@
                 if (!c || !c.id) return;
                 var k = key(c);
                 if (!byKey[k]) byKey[k] = Object.assign({}, c);
-                else if (feed4k(c)) byKey[k].release_quality = c.release_quality;
+                else {
+                    if (feed4k(c)) byKey[k].release_quality = c.release_quality;
+                    if (c._anton_recent_episodes) byKey[k]._anton_recent_episodes = true;
+                }
             });
             var unique = Object.keys(byKey).map(function (k) { return byKey[k]; });
 
@@ -325,6 +343,12 @@
             var significant = clean.filter(function (c) { return isSignificant(c, a24); });
 
             check4k(significant, function (results) {
+                addLastAirDates(results, function () {
+                    finish(results);
+                });
+            });
+
+            function finish(results) {
                 results.forEach(function (c) {
                     c.source = 'tmdb';
                     if (!feed4k(c)) c.release_quality = '4K';
@@ -350,6 +374,22 @@
 
                 if (results.length) writeCache(results);
                 done(results);
+            }
+        });
+    }
+
+    // Для сериалов сортируем по дате последней вышедшей серии
+    function addLastAirDates(cards, done) {
+        var tv = cards.filter(isTv);
+        var left = tv.length;
+        if (!left) return done();
+        tv.forEach(function (c) {
+            var net = new Lampa.Reguest();
+            net.silent(Lampa.TMDB.api('tv/' + c.id + '?api_key=' + Lampa.TMDB.key() + '&language=ru'), function (d) {
+                if (d && d.last_air_date) c._anton_last_air = d.last_air_date;
+                if (--left === 0) done();
+            }, function () {
+                if (--left === 0) done();
             });
         });
     }
