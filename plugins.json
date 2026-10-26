@@ -1,0 +1,9 @@
+[
+    {
+        "id": "torrserver_watchdog",
+        "file": "torrserver-watchdog.js",
+        "name": "Сторож TorrServer",
+        "description": "Предупреждает, если TorrServer не отвечает",
+        "default": true
+    }
+]
